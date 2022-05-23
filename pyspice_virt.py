@@ -66,7 +66,7 @@ SPICE_LINK_MESSAGE_STRUCT = "<5I2B3I" # 4 UINT32s, 2 UINT8s, 3 UINT32s
 
 SPICE_LINK_MESSAGE_DUMMY_STRUCT = "<4I" # used for size calculation
 
-SPICE_LINK_REPLY_STRUCT   = "<5IB3I"
+SPICE_LINK_REPLY_STRUCT   = f"<5I {SPICE_TICKET_PUBKEY_BYTES}s 3I"
 SPICE_DATA_HEADER_STRUCT  = "<QH2I"
 
 # HACK - captured traffic does NOT use serial number on messages??
@@ -87,10 +87,17 @@ def _create_spice_ticket(keydata, password):
     """
     Internal function to encrypt a password with the server's provided RSA key.
     """
+    password = bytes(password, encoding='utf-8')
     rsa_key = RSA.import_key(keydata)
     rsa_cipher = PKCS1_OAEP.new(rsa_key)
     ticket = rsa_cipher.encrypt(password)
     return ticket
+
+def _get_struct_size(struct_input):
+    """
+    Internal function to get the size of a packed struct
+    """
+    return struct.Struct(struct_input).size
 
 class SpiceClient:
     """
@@ -129,7 +136,7 @@ class SpiceClient:
         for channel in self.channels:
             self.channels[channel].cleanup()
 
-
+ 
 class SpiceChannel:
     """
     An internal class for a SPICE channel connection.
@@ -143,6 +150,9 @@ class SpiceChannel:
         self.session_id = session_id
     
     async def create_connection(self):
+        """
+        Initialise a connection to the server.
+        """
         self.reader, self.writer = await asyncio.open_connection(
             self.hostname, self.port
         )
@@ -158,17 +168,6 @@ class SpiceChannel:
         num_channel_caps = (
             1 if self.channel_type in SPICE_CHANNEL_CAPABILITIES else 0
         )
-
-        # Struct debugging
-        logging.debug("Struct debug dump - linkmsg - in order as used")
-        logging.debug(type(SPICE_MAGIC))
-        logging.debug(type(SPICE_VERSION_MAJOR))
-        logging.debug(type(SPICE_VERSION_MINOR))
-        logging.debug(type(self.session_id))
-        logging.debug(type(self.channel_type))
-        logging.debug(type(num_common_caps))
-        logging.debug(type(num_channel_caps))
-        
 
         spice_link_message = struct.pack(
             SPICE_LINK_MESSAGE_STRUCT,
@@ -186,23 +185,28 @@ class SpiceChannel:
           + bytes(
               [SPICE_CHANNEL_CAPABILITIES.get(self.channel_type, None)]
             ).ljust(4,b'\0')
-        
-        logging.debug(("Data to be sent to server:", spice_link_message))
-        logging.debug(f"Size of data: {len(spice_link_message)}")
+
         logging.debug(f"Sending SPICE_LINK_MESS for ch. {self.channel_type}...")
         self.writer.write(spice_link_message)
         await self.writer.drain()
         
+        # HACK - we're technically disregarding the capabilities of the
+        # server here. I'm building this around QEMU 7. This may change in the
+        # future. Ideally, I need to write code to correctly fetch the
+        # server capabiltiies.
         logging.debug(f"Waiting for server response...")
-        spice_link_reply_data = await self.reader.read(100)
+        spice_link_reply_data = await self.reader.read(
+            _get_struct_size(SPICE_LINK_REPLY_STRUCT)
+        )
         spice_link_reply = struct.unpack(
             SPICE_LINK_REPLY_STRUCT,
-            spice_link_reply_data[:33]
+            spice_link_reply_data
         )
         logging.debug((
             "REPLY FROM SERVER:",
             spice_link_reply
         ))
+
         if spice_link_reply[0] != SPICE_MAGIC:
             logging.warn("Server reply didn't have correct magic!")
         else:
@@ -212,7 +216,27 @@ class SpiceChannel:
             logging.debug("Relax and breathe - server accepted connection")
         else:
             error_name = SPICE_LINK_ERR_DICT.get(spice_link_error_code, "other")
-            logging.debug(f"Server returned non-0 error: {error_name}")
+            logging.error(f"Server returned non-0 error: {error_name}")
+        
+        # Let's finish the handshake.
+        logging.debug("Attempting to authenticate with given key...")
+
+        # HACK - this effectively forces SPICE auth!
+        # Not a problem rn, but...
+        self.writer.write(b'\x01\x00\x00\x00') # SPICE auth magic
+        await self.writer.drain()
+
+        given_key = spice_link_reply[5]
+        ticket = _create_spice_ticket(given_key, self.password)
+        self.writer.write(ticket)
+        await self.writer.drain()
+        
+        auth_result = await self.reader.read(4)
+        if spice_link_error_code == 0:
+            logging.debug("Authentication succesful!")
+        else:
+            error_name = SPICE_LINK_ERR_DICT.get(spice_link_error_code, "other")
+            logging.error(f"Server returned non-0 error: {error_name}")
     
     def cleanup(self):
         self.writer.close()
