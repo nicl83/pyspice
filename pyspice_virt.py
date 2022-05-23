@@ -1,4 +1,5 @@
 from ast import Constant
+from email import header
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP
 import asyncio
@@ -69,10 +70,11 @@ SPICE_LINK_MESSAGE_DUMMY_STRUCT = "<4I" # used for size calculation
 SPICE_LINK_REPLY_STRUCT   = f"<5I {SPICE_TICKET_PUBKEY_BYTES}s 3I"
 SPICE_DATA_HEADER_STRUCT  = "<QH2I"
 
-# HACK - captured traffic does NOT use serial number on messages??
-# If this breaks, we can always go back to SPICE_DATA_HEADER_STRUCT
-# Throw it in a try/except, let Python handle it!
-SPICE_DATA_HEADER_NOSERIAL_STRUCT = "<H2I"
+# HACK
+# This struct is based on observed data, not the spec.
+# If this breaks, yell at me, and also at the QEMU devs.
+SPICE_DATA_HEADER_NOSERIAL_STRUCT = "<HI"
+
 
 # What can PySpice_VIRT actually do?
 SPICE_CLIENT_CAPABILITIES = 0x9 # HACK, see below
@@ -202,10 +204,10 @@ class SpiceChannel:
             SPICE_LINK_REPLY_STRUCT,
             spice_link_reply_data
         )
-        logging.debug((
-            "REPLY FROM SERVER:",
-            spice_link_reply
-        ))
+        # logging.debug((
+        #     "REPLY FROM SERVER:",
+        #     spice_link_reply
+        # ))
 
         if spice_link_reply[0] != SPICE_MAGIC:
             logging.warn("Server reply didn't have correct magic!")
@@ -231,12 +233,16 @@ class SpiceChannel:
         self.writer.write(ticket)
         await self.writer.drain()
         
-        auth_result = await self.reader.read(4)
-        if spice_link_error_code == 0:
-            logging.debug("Authentication succesful!")
-        else:
-            error_name = SPICE_LINK_ERR_DICT.get(spice_link_error_code, "other")
-            logging.error(f"Server returned non-0 error: {error_name}")
+        auth_result = await self.reader.read(11)
+        logging.debug("Abandoning authentication attempt, you are on your own")
+        logging.debug(auth_result)
+        # if auth_result == 0:
+        #     logging.debug("Authentication succesful!")
+        #     self.task = asyncio.create_task(self.msg_loop())
+        # else:
+        #     error_name = SPICE_LINK_ERR_DICT.get(auth_result, auth_result)
+        #     logging.error(f"Server returned non-0 error: {error_name}")
+        self.writer.close()
     
     def cleanup(self):
         self.writer.close()
@@ -247,3 +253,17 @@ class SpiceChannel:
         else:
             firstpart = "Dead SPICE channel, "
         return firstpart + f"server {self.hostname} port {self.port}"
+
+    async def msg_loop(self):
+        logging.debug(f"Entering message loop for channel {self.channel_type}")
+        while True:
+            incoming_header = await self.reader.read(6)
+            logging.debug(("raw header", incoming_header))
+            header_info = struct.unpack(
+                SPICE_DATA_HEADER_NOSERIAL_STRUCT,
+                incoming_header)
+            msg_data = await self.reader.read(header_info[1])
+            logging.debug(
+                f"Recieved message type {header_info[0]} size {header_info[1]}"
+            )
+            logging.debug(f"Data: {msg_data}")
